@@ -1,0 +1,20 @@
+# Maintainer: PlanerNL <your-email@example.com>
+pkgname=connect-for-onedrive
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Connect Microsoft OneDrive to your file manager via rclone, with a system tray icon"
+arch=('any')
+url="https://github.com/PlanerNL/connect-for-onedrive"
+license=('MIT')
+depends=('python' 'pyside6' 'rclone' 'fuse3')
+optdepends=('dolphin: OneDrive entry in the Places sidebar')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 "$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+    install -Dm644 "$pkgname.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/$pkgname.svg"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

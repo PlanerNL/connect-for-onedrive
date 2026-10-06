@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Connect for OneDrive
+Comment=Connect OneDrive to your file manager
+Comment[nl]=Koppel OneDrive aan je bestandsbeheerder
+Exec=connect-for-onedrive
+Icon=connect-for-onedrive
+Categories=Network;FileTransfer;Utility;Qt;
+Keywords=onedrive;microsoft;cloud;rclone;sync;

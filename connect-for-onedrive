@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+"""
+Connect for OneDrive: connects Microsoft OneDrive to your Linux desktop via rclone.
+
+- Sign in through the browser (rclone authorize)
+- Mount via a systemd user service (~/OneDrive, starts at every login)
+- A OneDrive entry in the sidebar of Dolphin (KDE) and GTK file managers
+- Checks whether the sign-in is still valid, with 'Sign in again'
+- System tray icon with quick menu and notifications on problems
+- English and Dutch user interface
+
+Options:  --tray     start only the system tray icon
+          --cleanup  remove the service, sidebar entries and autostart
+
+Requirements: Python 3.10+, PySide6, rclone and fuse3 (see install.sh)
+"""
+
+import base64
+import signal
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QIcon, QPixmap
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QHBoxLayout, QLabel, QMenu, QMessageBox,
+    QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
+)
+
+# ------------------------------------------------------------------ settings
+APP_ID = "connect-for-onedrive"
+APP_NAME = "Connect for OneDrive"
+REMOTE = "onedrive"                    # name of the rclone remote
+MOUNT_DIR = Path.home() / "OneDrive"   # where OneDrive appears
+SERVICE = "onedrive-mount.service"
+SERVICE_PATH = Path.home() / ".config/systemd/user" / SERVICE
+PLACES = Path.home() / ".local/share/user-places.xbel"
+GTK_BOOKMARKS = Path.home() / ".config/gtk-3.0/bookmarks"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_ID
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+AUTOSTART = Path.home() / ".config/autostart" / f"{APP_ID}.desktop"
+LEGACY_IDS = ("onedrive-koppelen", "onedrive-connect")   # earlier names of this app
+CACHE_SIZE = "10G"                     # maximum local cache
+CHECK_INTERVAL_MS = 30 * 60 * 1000     # sign-in check every 30 minutes
+STATUS_INTERVAL_MS = 60 * 1000         # mount status every minute
+WEB_URL = "https://onedrive.live.com/"
+SOCKET_NAME = f"{APP_ID}-{os.getuid()}"
+
+AUTH_ERRORS = ("invalid_grant", "unauthenticated", "invalidauthenticationtoken",
+               "couldn't fetch token", "token expired", "401")
+
+# ---------------------------------------------------------------- languages
+LANGUAGES = {"en": "English", "nl": "Nederlands"}
+
+STRINGS = {
+    "en": {
+        "connect": "Connect",
+        "open_folder": "Open folder",
+        "sign_in_again": "Sign in again",
+        "disconnect": "Disconnect",
+        "cancel": "Cancel",
+        "tray_open": "Open OneDrive folder",
+        "tray_web": "OneDrive on the web",
+        "tray_check": "Check now",
+        "tray_restart": "Restart mount",
+        "tray_show": "Show window",
+        "tray_autostart": "Start at login",
+        "tray_language": "Language",
+        "tray_quit": "Quit",
+        "tooltip": "OneDrive: {status}",
+        "short_busy": "Working…",
+        "short_deps": "rclone or fuse3 missing",
+        "short_none": "Not connected",
+        "short_login": "Sign-in expired",
+        "short_offline": "Unreachable",
+        "short_ok": "Connected",
+        "short_conflict": "Other mount active",
+        "short_unmounted": "Not mounted",
+        "usage": "{used} of {total} used",
+        "long_deps": "Missing: <b>{deps}</b><br>Install rclone and fuse3 with your package manager.",
+        "long_none": "Not connected yet. Click <b>Connect</b> to sign in to Microsoft.",
+        "long_login": "🔑 Your Microsoft sign-in has expired. Click <b>Sign in again</b>.",
+        "long_offline": "⚠️ OneDrive can't be reached right now (no internet?). "
+                        "The mount keeps retrying by itself.",
+        "long_ok": "✅ Connected. Your files are in <b>{path}</b>.",
+        "long_conflict": "⚠️ Another mount is already active on ~/OneDrive "
+                         "(for example an old rclone service).",
+        "long_unmounted": "Signed in, but OneDrive is not mounted. Click <b>Connect</b>.",
+        "busy_browser": "🌐 Your browser has opened. Sign in to Microsoft and grant "
+                        "access. It will continue here automatically.",
+        "busy_mount": "Mounting…",
+        "busy_restart": "Restarting mount…",
+        "busy_disconnect": "Disconnecting…",
+        "notif_login": "Your Microsoft sign-in has expired. Choose 'Sign in again'.",
+        "notif_offline": "OneDrive can't be reached. The mount keeps retrying by itself.",
+        "notif_unmounted": "OneDrive is no longer mounted. Choose 'Restart mount'.",
+        "notif_conflict": "Another mount is running on ~/OneDrive.",
+        "notif_browser": "Your browser has opened. Sign in to Microsoft.",
+        "notif_signed_in": "You're signed in to OneDrive again.",
+        "notif_restart_failed": "Restarting the mount failed.",
+        "notif_tray_hint": "Connect for OneDrive keeps running in the system tray.",
+        "err_in_use_title": "~/OneDrive is already in use",
+        "err_in_use": "Another mount is already active on this folder. Stop it first "
+                      "(e.g. your old rclone service) and try again.",
+        "err_not_empty_title": "~/OneDrive is not empty",
+        "err_not_empty": "rclone can only mount into an empty folder. "
+                         "Move or rename the current contents first.",
+        "err_mount_title": "Mounting failed",
+        "err_login_title": "Sign-in failed",
+        "err_places_title": "Updating the sidebar failed",
+        "err_no_token": "No token found in rclone's output.",
+        "err_token_format": "Unexpected token format from rclone.",
+        "err_encrypted": "Your rclone config is encrypted. This version doesn't support that yet.",
+        "err_rclone_stopped": "rclone stopped unexpectedly.",
+        "err_xbel": "{path} seems damaged (no </xbel>).",
+        "dolphin_title": "Restart Dolphin?",
+        "dolphin_text": "Dolphin needs to restart briefly to update the sidebar. Restart now?",
+        "disc_title": "Disconnect",
+        "disc_text": "Disconnect OneDrive from this computer?",
+        "disc_info": "Your files in OneDrive itself stay where they are.",
+        "disc_full": "Disconnect and sign out",
+        "cleanup_done": "Service, sidebar entries and autostart removed.\n"
+                        "Your rclone sign-in is still in rclone.conf; remove it with: "
+                        "rclone config delete {remote}",
+    },
+    "nl": {
+        "connect": "Koppelen",
+        "open_folder": "Map openen",
+        "sign_in_again": "Opnieuw inloggen",
+        "disconnect": "Ontkoppelen",
+        "cancel": "Annuleren",
+        "tray_open": "OneDrive-map openen",
+        "tray_web": "OneDrive op het web",
+        "tray_check": "Nu controleren",
+        "tray_restart": "Mount herstarten",
+        "tray_show": "Venster tonen",
+        "tray_autostart": "Starten bij inloggen",
+        "tray_language": "Taal",
+        "tray_quit": "Afsluiten",
+        "tooltip": "OneDrive: {status}",
+        "short_busy": "Bezig…",
+        "short_deps": "rclone of fuse3 ontbreekt",
+        "short_none": "Niet gekoppeld",
+        "short_login": "Login verlopen",
+        "short_offline": "Niet bereikbaar",
+        "short_ok": "Gekoppeld",
+        "short_conflict": "Andere mount actief",
+        "short_unmounted": "Niet gemount",
+        "usage": "{used} van {total} gebruikt",
+        "long_deps": "Ontbrekend: <b>{deps}</b><br>Installeer rclone en fuse3 met je pakketbeheer.",
+        "long_none": "Nog niet gekoppeld. Klik op <b>Koppelen</b> om in te loggen bij Microsoft.",
+        "long_login": "🔑 Je login bij Microsoft is verlopen. Klik op <b>Opnieuw inloggen</b>.",
+        "long_offline": "⚠️ OneDrive is nu niet bereikbaar (geen internet?). "
+                        "De mount probeert het zelf opnieuw.",
+        "long_ok": "✅ Gekoppeld. Je bestanden staan in <b>{path}</b>.",
+        "long_conflict": "⚠️ Er is al een andere mount actief op ~/OneDrive "
+                         "(bijvoorbeeld een oude rclone-service).",
+        "long_unmounted": "Ingelogd, maar OneDrive is niet gemount. Klik op <b>Koppelen</b>.",
+        "busy_browser": "🌐 Je browser is geopend. Log in bij Microsoft en geef "
+                        "toestemming. Daarna gaat het hier vanzelf verder.",
+        "busy_mount": "Bezig met mounten…",
+        "busy_restart": "Mount wordt herstart…",
+        "busy_disconnect": "Bezig met ontkoppelen…",
+        "notif_login": "Je login bij Microsoft is verlopen. Kies 'Opnieuw inloggen'.",
+        "notif_offline": "OneDrive is niet bereikbaar. De mount probeert het zelf opnieuw.",
+        "notif_unmounted": "OneDrive is niet meer gemount. Kies 'Mount herstarten'.",
+        "notif_conflict": "Er draait een andere mount op ~/OneDrive.",
+        "notif_browser": "Je browser is geopend. Log in bij Microsoft.",
+        "notif_signed_in": "Je bent weer ingelogd bij OneDrive.",
+        "notif_restart_failed": "Herstarten van de mount is mislukt.",
+        "notif_tray_hint": "Connect for OneDrive draait verder in het systeemvak.",
+        "err_in_use_title": "~/OneDrive is al in gebruik",
+        "err_in_use": "Er draait al een andere mount op deze map. Stop die eerst "
+                      "(bijv. je oude rclone-service) en probeer opnieuw.",
+        "err_not_empty_title": "~/OneDrive is niet leeg",
+        "err_not_empty": "rclone kan alleen in een lege map mounten. "
+                         "Verplaats of hernoem de huidige inhoud eerst.",
+        "err_mount_title": "Mounten mislukt",
+        "err_login_title": "Inloggen mislukt",
+        "err_places_title": "Zijbalk aanpassen mislukt",
+        "err_no_token": "Geen token gevonden in de uitvoer van rclone.",
+        "err_token_format": "Onverwacht tokenformaat van rclone.",
+        "err_encrypted": "Je rclone-config is versleuteld. Dat ondersteunt deze versie nog niet.",
+        "err_rclone_stopped": "rclone stopte onverwacht.",
+        "err_xbel": "{path} lijkt beschadigd (geen </xbel>).",
+        "dolphin_title": "Dolphin herstarten?",
+        "dolphin_text": "Dolphin moet even opnieuw starten om de zijbalk bij te werken. "
+                        "Nu herstarten?",
+        "disc_title": "Ontkoppelen",
+        "disc_text": "OneDrive ontkoppelen van deze computer?",
+        "disc_info": "Je bestanden in OneDrive zelf blijven gewoon bestaan.",
+        "disc_full": "Ontkoppelen en uitloggen",
+        "cleanup_done": "Service, zijbalk-entries en autostart verwijderd.\n"
+                        "Je rclone-login staat nog in rclone.conf; verwijderen met: "
+                        "rclone config delete {remote}",
+    },
+}
+
+
+def migrate_legacy_settings():
+    """Take over the settings of an earlier app name (once)."""
+    if SETTINGS_FILE.exists():
+        return
+    for old in LEGACY_IDS:
+        old_file = CONFIG_DIR.parent / old / "settings.json"
+        if old_file.exists():
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(old_file, SETTINGS_FILE)
+            return
+
+
+def migrate_legacy_autostart():
+    """Replace the autostart entry of an earlier app name with ours."""
+    found = False
+    for old in LEGACY_IDS:
+        old_file = AUTOSTART.parent / f"{old}.desktop"
+        if old_file.exists():
+            old_file.unlink()
+            found = True
+    if found:
+        set_autostart(True)
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+
+
+migrate_legacy_settings()
+LANG = load_settings().get("language", "en")
+if LANG not in STRINGS:
+    LANG = "en"
+
+
+def t(key: str, **kw) -> str:
+    """Translated text for the current language (English as fallback)."""
+    text = STRINGS[LANG].get(key) or STRINGS["en"][key]
+    return text.format(**kw) if kw else text
+
+
+# ------------------------------------------------------------------ helpers
+def run(*cmd, check=False):
+    """Run a command that can never get stuck waiting for input."""
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, check=check)
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+# ------------------------------------------------------------------- rclone
+def missing_deps() -> list[str]:
+    return [p for p in ("rclone", "fusermount3") if not shutil.which(p)]
+
+
+def rclone_config_path() -> Path:
+    lines = run("rclone", "config", "file").stdout.strip().splitlines()
+    return Path(lines[-1].strip())
+
+
+def remote_exists() -> bool:
+    return f"{REMOTE}:" in run("rclone", "listremotes").stdout.split()
+
+
+def parse_token(output: str) -> dict:
+    """Extract the OAuth token from the output of 'rclone authorize'."""
+    m = re.search(r"--->\s*(.+?)\s*<---End paste", output, re.S)
+    if not m:
+        raise RuntimeError(t("err_no_token"))
+    blob = m.group(1).strip()
+    if not blob.startswith("{"):            # some versions output base64
+        blob = base64.urlsafe_b64decode(blob + "=" * (-len(blob) % 4)).decode()
+    data = json.loads(blob)
+    if isinstance(data.get("token"), str):  # token wrapped in a config blob
+        data = json.loads(data["token"])
+    if "access_token" not in data:
+        raise RuntimeError(t("err_token_format"))
+    return data
+
+
+def fetch_drive(access_token: str) -> tuple[str, str]:
+    """Ask Microsoft Graph which drive belongs to this account."""
+    req = urllib.request.Request(
+        "https://graph.microsoft.com/v1.0/me/drive",
+        headers={"Authorization": f"Bearer {access_token}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        drive = json.load(r)
+    return drive["id"], drive.get("driveType", "personal")
+
+
+def write_remote(token: dict, drive_id: str, drive_type: str):
+    """Write (or replace) the remote section in rclone.conf."""
+    path = rclone_config_path()
+    text = path.read_text() if path.exists() else ""
+    if "RCLONE_ENCRYPT_V0" in text:
+        raise RuntimeError(t("err_encrypted"))
+    text = re.sub(rf"(?ms)^\[{re.escape(REMOTE)}\]\n.*?(?=^\[|\Z)", "", text).strip()
+    section = (f"[{REMOTE}]\n"
+               f"type = onedrive\n"
+               f"token = {json.dumps(token, separators=(',', ':'))}\n"
+               f"drive_id = {drive_id}\n"
+               f"drive_type = {drive_type}\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{text}\n\n{section}" if text else section)
+    path.chmod(0o600)
+
+
+# ------------------------------------------------------------------ systemd
+SERVICE_TEMPLATE = """\
+[Unit]
+Description=OneDrive (rclone mount)
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre={mkdir} -p "{mount}"
+ExecStart={rclone} mount {remote}: "{mount}" \\
+    --vfs-cache-mode full --vfs-cache-max-size {cache} \\
+    --dir-cache-time 5m --poll-interval 1m
+ExecStop={fusermount} -uz "{mount}"
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def systemctl(*args, check=False):
+    return run("systemctl", "--user", *args, check=check)
+
+
+def service_active() -> bool:
+    return systemctl("is-active", SERVICE).stdout.strip() == "active"
+
+
+def install_service():
+    SERVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SERVICE_PATH.write_text(SERVICE_TEMPLATE.format(
+        mount=MOUNT_DIR, remote=REMOTE, cache=CACHE_SIZE, mkdir=shutil.which("mkdir"),
+        rclone=shutil.which("rclone"), fusermount=shutil.which("fusermount3")))
+    systemctl("daemon-reload", check=True)
+    systemctl("enable", "--now", SERVICE, check=True)
+
+
+def remove_service():
+    systemctl("disable", "--now", SERVICE)
+    SERVICE_PATH.unlink(missing_ok=True)
+    systemctl("daemon-reload")
+
+
+# ------------------------------------------------------------------ sidebar
+def is_kde() -> bool:
+    return "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+
+
+XBEL_NS = 'xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks"'
+XBEL_EMPTY = (f'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xbel>\n'
+              f'<xbel {XBEL_NS}>\n</xbel>\n')
+
+
+def place_icon() -> str:
+    # Only real theme icons: file managers don't always find icons in ~/.local
+    return "onedrive" if QIcon.hasThemeIcon("onedrive") else "folder-cloud"
+
+
+def add_kde_place():
+    url = MOUNT_DIR.as_uri()
+    text = PLACES.read_text() if PLACES.exists() else XBEL_EMPTY
+    if f'href="{url}"' in text:
+        return
+    if "xmlns:bookmark=" not in text:
+        text = text.replace("<xbel", f"<xbel {XBEL_NS}", 1)
+    head, sep, tail = text.rpartition("</xbel>")
+    if not sep:
+        raise RuntimeError(t("err_xbel", path=PLACES))
+    entry = (f' <bookmark href="{url}">\n'
+             f'  <title>OneDrive</title>\n'
+             f'  <info>\n'
+             f'   <metadata owner="http://freedesktop.org">\n'
+             f'    <bookmark:icon name="{place_icon()}"/>\n'
+             f'   </metadata>\n'
+             f'   <metadata owner="http://www.kde.org">\n'
+             f'    <ID>{int(time.time())}/0</ID>\n'
+             f'   </metadata>\n'
+             f'  </info>\n'
+             f' </bookmark>\n')
+    PLACES.parent.mkdir(parents=True, exist_ok=True)
+    PLACES.write_text(head + entry + sep + tail)
+
+
+def remove_kde_place():
+    if not PLACES.exists():
+        return
+    url = re.escape(MOUNT_DIR.as_uri())
+    text = re.sub(rf'\s*<bookmark href="{url}">.*?</bookmark>', "",
+                  PLACES.read_text(), flags=re.S)
+    PLACES.write_text(text)
+
+
+def add_gtk_bookmark():
+    """Nautilus, Nemo, Thunar, Caja and GTK file dialogs."""
+    if is_kde() and not GTK_BOOKMARKS.exists():
+        return
+    url = MOUNT_DIR.as_uri()
+    lines = GTK_BOOKMARKS.read_text().splitlines() if GTK_BOOKMARKS.exists() else []
+    if any(line.split(" ", 1)[0] == url for line in lines):
+        return
+    GTK_BOOKMARKS.parent.mkdir(parents=True, exist_ok=True)
+    GTK_BOOKMARKS.write_text("\n".join(lines + [f"{url} OneDrive"]) + "\n")
+
+
+def remove_gtk_bookmark():
+    if not GTK_BOOKMARKS.exists():
+        return
+    url = MOUNT_DIR.as_uri()
+    lines = [line for line in GTK_BOOKMARKS.read_text().splitlines()
+             if line.split(" ", 1)[0] != url]
+    GTK_BOOKMARKS.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
+def add_places():
+    if is_kde() or PLACES.exists():
+        add_kde_place()
+    add_gtk_bookmark()
+
+
+def remove_places():
+    remove_kde_place()
+    remove_gtk_bookmark()
+
+
+def open_folder():
+    opener = "dolphin" if shutil.which("dolphin") else "xdg-open"
+    subprocess.Popen([opener, str(MOUNT_DIR)], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def dolphin_running() -> bool:
+    return run("pgrep", "-x", "dolphin").returncode == 0
+
+
+# ---------------------------------------------------------------- autostart
+def autostart_enabled() -> bool:
+    return AUTOSTART.exists()
+
+
+def set_autostart(on: bool):
+    if not on:
+        AUTOSTART.unlink(missing_ok=True)
+        return
+    exe = shutil.which(APP_ID) or str(Path(sys.argv[0]).resolve())
+    AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+    AUTOSTART.write_text("[Desktop Entry]\n"
+                         "Type=Application\n"
+                         f"Name={APP_NAME}\n"
+                         f"Exec={exe} --tray\n"
+                         f"Icon={APP_ID}\n")
+
+
+# ---------------------------------------------------------------------- GUI
+APP_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#1f9e89"/>
+  <g fill="#ffffff">
+    <circle cx="23" cy="37" r="8"/>
+    <circle cx="33" cy="29" r="11"/>
+    <circle cx="43" cy="37" r="8"/>
+    <rect x="23" y="36" width="20" height="9"/>
+  </g>
+  <g fill="none" stroke="#1f9e89" stroke-width="2.6" stroke-linecap="round">
+    <rect x="23.5" y="33.5" width="11" height="6" rx="3" transform="rotate(-35 29 36.5)"/>
+    <rect x="31.5" y="29.5" width="11" height="6" rx="3" transform="rotate(-35 37 32.5)"/>
+  </g>
+</svg>"""
+
+
+def app_icon() -> QIcon:
+    """Theme's OneDrive icon if present, otherwise our own built-in icon."""
+    if QIcon.hasThemeIcon("onedrive"):
+        return QIcon.fromTheme("onedrive")
+    icon = QIcon()
+    for size in (16, 22, 24, 32, 48, 64, 128):
+        pm = QPixmap()
+        if pm.loadFromData(APP_SVG, "SVG"):
+            icon.addPixmap(pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation))
+    return icon if not icon.isNull() else QIcon.fromTheme(APP_ID, QIcon.fromTheme("folder-cloud"))
+
+
+def warning_icon() -> QIcon:
+    return QIcon.fromTheme("data-warning", QIcon.fromTheme("dialog-warning"))
+
+
+def as_pixmaps(icon: QIcon) -> QIcon:
+    """Copy of the icon without a theme name, so the tray gets real images.
+    Otherwise Qt only sends the icon *name*, and Plasma can't always resolve
+    it (e.g. icons in ~/.local/share/icons), which leaves an invisible item."""
+    out = QIcon()
+    for size in (16, 22, 24, 32, 48, 64):
+        out.addPixmap(icon.pixmap(size, size))
+    return out
+
+
+# States that trigger a notification (once seen twice in a row)
+PROBLEM_STATES = ("login", "offline", "unmounted", "conflict")
+
+
+class Window(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowIcon(app_icon())
+        self.setMinimumWidth(480)
+
+        self.proc: QProcess | None = None   # running 'rclone authorize'
+        self.output = ""
+        self.cancelled = False
+        self.after_login = None
+        self.busy_key = ""       # key of the current busy text
+        self.alert = ""          # "", "login" or "offline"
+        self.storage = None      # (used, total) as text
+        self.state = None
+        self.notified = None
+        self.quitting = False
+        self.hint_shown = False
+
+        logo = QLabel()
+        logo.setPixmap(app_icon().pixmap(56, 56))
+        title = QLabel("OneDrive")
+        font = title.font()
+        font.setPointSize(font.pointSize() + 6)
+        font.setBold(True)
+        title.setFont(font)
+        self.lang_box = QComboBox()
+        for code, name in LANGUAGES.items():
+            self.lang_box.addItem(name, code)
+        self.lang_box.currentIndexChanged.connect(
+            lambda i: self.set_language(self.lang_box.itemData(i)))
+        header = QHBoxLayout()
+        header.addWidget(logo)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.lang_box, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.TextFormat.RichText)
+
+        self.btn_connect = QPushButton(QIcon.fromTheme("network-connect"), "")
+        self.btn_open = QPushButton(QIcon.fromTheme("system-file-manager"), "")
+        self.btn_relogin = QPushButton(QIcon.fromTheme("view-refresh"), "")
+        self.btn_disconnect = QPushButton(QIcon.fromTheme("network-disconnect"), "")
+        self.btn_cancel = QPushButton(QIcon.fromTheme("dialog-cancel"), "")
+
+        self.btn_connect.clicked.connect(self.on_connect)
+        self.btn_open.clicked.connect(open_folder)
+        self.btn_relogin.clicked.connect(self.on_relogin)
+        self.btn_disconnect.clicked.connect(self.on_disconnect)
+        self.btn_cancel.clicked.connect(self.on_cancel)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        for b in (self.btn_open, self.btn_relogin, self.btn_disconnect,
+                  self.btn_connect, self.btn_cancel):
+            buttons.addWidget(b)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(header)
+        layout.addWidget(self.status)
+        layout.addStretch()
+        layout.addLayout(buttons)
+
+        self.build_tray()
+        self.retranslate()
+
+        self.login_timer = QTimer(self)
+        self.login_timer.timeout.connect(self.check_login)
+        self.login_timer.start(CHECK_INTERVAL_MS)
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.refresh)
+        self.status_timer.start(STATUS_INTERVAL_MS)
+
+        QTimer.singleShot(300, self.check_login)
+
+    # ----------------------------------------------------------- language
+    def set_language(self, code: str):
+        global LANG
+        if code not in STRINGS or code == LANG:
+            return
+        LANG = code
+        settings = load_settings()
+        settings["language"] = code
+        save_settings(settings)
+        self.retranslate()
+
+    def retranslate(self):
+        self.setWindowTitle(APP_NAME)
+        self.btn_connect.setText(t("connect"))
+        self.btn_open.setText(t("open_folder"))
+        self.btn_relogin.setText(t("sign_in_again"))
+        self.btn_disconnect.setText(t("disconnect"))
+        self.btn_cancel.setText(t("cancel"))
+
+        self.act_open.setText(t("tray_open"))
+        self.act_web.setText(t("tray_web"))
+        self.act_check.setText(t("tray_check"))
+        self.act_restart.setText(t("tray_restart"))
+        self.act_relogin.setText(t("sign_in_again"))
+        self.act_show.setText(t("tray_show"))
+        self.act_autostart.setText(t("tray_autostart"))
+        self.lang_menu.setTitle(t("tray_language"))
+        self.act_quit.setText(t("tray_quit"))
+
+        # keep the combo box and the tray menu in sync
+        self.lang_box.blockSignals(True)
+        self.lang_box.setCurrentIndex(self.lang_box.findData(LANG))
+        self.lang_box.blockSignals(False)
+        self.lang_actions[LANG].setChecked(True)
+        self.refresh()
+
+    # --------------------------------------------------------- system tray
+    def build_tray(self):
+        self.tray_icons = {False: as_pixmaps(app_icon()), True: as_pixmaps(warning_icon())}
+        self.tray_problem = False
+        self.tray = QSystemTrayIcon(self.tray_icons[False], self)
+        menu = QMenu(self)
+
+        self.act_status = QAction("…", self)
+        self.act_status.setEnabled(False)
+        self.act_open = QAction(QIcon.fromTheme("folder-open"), "", self)
+        self.act_web = QAction(QIcon.fromTheme("internet-web-browser"), "", self)
+        self.act_check = QAction(QIcon.fromTheme("view-refresh"), "", self)
+        self.act_restart = QAction(QIcon.fromTheme("system-reboot"), "", self)
+        self.act_relogin = QAction(QIcon.fromTheme("dialog-password"), "", self)
+        self.act_show = QAction(QIcon.fromTheme("configure"), "", self)
+        self.act_autostart = QAction("", self)
+        self.act_autostart.setCheckable(True)
+        self.act_autostart.setChecked(autostart_enabled())
+        self.act_quit = QAction(QIcon.fromTheme("application-exit"), "", self)
+
+        self.lang_menu = QMenu(menu)
+        self.lang_menu.setIcon(QIcon.fromTheme("preferences-desktop-locale"))
+        group = QActionGroup(self)
+        self.lang_actions = {}
+        for code, name in LANGUAGES.items():
+            act = QAction(name, self, checkable=True)
+            act.triggered.connect(lambda _=False, c=code: self.set_language(c))
+            group.addAction(act)
+            self.lang_menu.addAction(act)
+            self.lang_actions[code] = act
+
+        self.act_open.triggered.connect(open_folder)
+        self.act_web.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(WEB_URL)))
+        self.act_check.triggered.connect(lambda: (self.refresh(), self.check_login()))
+        self.act_restart.triggered.connect(self.on_restart_mount)
+        self.act_relogin.triggered.connect(self.on_relogin)
+        self.act_show.triggered.connect(self.show_window)
+        self.act_autostart.toggled.connect(set_autostart)
+        self.act_quit.triggered.connect(self.quit_app)
+
+        menu.addAction(self.act_status)
+        menu.addSeparator()
+        for a in (self.act_open, self.act_web):
+            menu.addAction(a)
+        menu.addSeparator()
+        for a in (self.act_check, self.act_restart, self.act_relogin):
+            menu.addAction(a)
+        menu.addSeparator()
+        menu.addAction(self.act_show)
+        menu.addAction(self.act_autostart)
+        menu.addMenu(self.lang_menu)
+        menu.addSeparator()
+        menu.addAction(self.act_quit)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.on_tray_click)
+        self.ensure_tray()
+
+    def ensure_tray(self, tries: int = 0):
+        """At autostart the system tray may not be ready yet: wait a bit."""
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+        elif tries < 30:
+            QTimer.singleShot(1000, lambda: self.ensure_tray(tries + 1))
+        else:
+            self.show_window()
+
+    def on_tray_click(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if os.path.ismount(MOUNT_DIR):
+                open_folder()
+            else:
+                self.show_window()
+
+    def notify(self, text: str, warning: bool = False):
+        if self.tray.isVisible():
+            self.tray.showMessage("OneDrive", text, self.tray_icons[warning], 8000)
+
+    def show_window(self):
+        self.refresh()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    # -------------------------------------------------------------- status
+    def refresh(self):
+        busy = self.proc is not None or bool(self.busy_key)
+        deps = missing_deps()
+        has_remote = not deps and remote_exists()
+        mounted = os.path.ismount(MOUNT_DIR)
+        active = not deps and service_active()
+
+        if self.busy_key:
+            state, text = "busy", t(self.busy_key)
+        elif deps:
+            state, text = "deps", t("long_deps", deps=", ".join(deps))
+        elif not has_remote:
+            state, text = "none", t("long_none")
+        elif self.alert == "login":
+            state, text = "login", t("long_login")
+        elif active and mounted:
+            if self.alert == "offline":
+                state, text = "offline", t("long_offline")
+            else:
+                state, text = "ok", t("long_ok", path=MOUNT_DIR)
+        elif mounted:
+            state, text = "conflict", t("long_conflict")
+        else:
+            state, text = "unmounted", t("long_unmounted")
+
+        short = t(f"short_{state}")
+        if state == "ok" and self.storage:
+            usage = t("usage", used=self.storage[0], total=self.storage[1])
+            short += f" · {usage}"
+            text += f"<br>{usage}."
+
+        # window
+        self.status.setText(text)
+        self.btn_connect.setVisible(not busy and not (active and mounted))
+        self.btn_connect.setEnabled(not deps)
+        self.btn_open.setVisible(not busy and active and mounted)
+        self.btn_relogin.setVisible(not busy and has_remote)
+        self.btn_disconnect.setVisible(not busy and (has_remote or SERVICE_PATH.exists()))
+        self.btn_cancel.setVisible(self.proc is not None)
+
+        # system tray
+        problem = state in PROBLEM_STATES
+        if problem != self.tray_problem:
+            self.tray.setIcon(self.tray_icons[problem])
+            self.tray_problem = problem
+        self.tray.setToolTip(t("tooltip", status=short))
+        self.act_status.setText(("⚠️ " if problem else "") + short)
+        self.act_open.setEnabled(mounted)
+        self.act_check.setEnabled(has_remote and not busy)
+        self.act_restart.setEnabled(SERVICE_PATH.exists() and not busy)
+        self.act_relogin.setEnabled(has_remote and not busy)
+
+        # only notify once a problem has been seen twice in a row
+        if problem:
+            if state == self.state and self.notified != state:
+                self.notify(t(f"notif_{state}"), warning=True)
+                self.notified = state
+        else:
+            self.notified = None
+        self.state = state
+
+    def set_busy(self, key: str):
+        self.busy_key = key
+        self.refresh()
+        QApplication.processEvents()
+
+    def error(self, title: str, details: str):
+        QMessageBox.critical(self, title, details.strip() or title)
+
+    # ------------------------------------------------------------- connect
+    def on_connect(self):
+        mounted = os.path.ismount(MOUNT_DIR)
+        if mounted and not service_active():
+            return self.error(t("err_in_use_title"), t("err_in_use"))
+        if not mounted and MOUNT_DIR.is_dir() and any(MOUNT_DIR.iterdir()):
+            return self.error(t("err_not_empty_title"), t("err_not_empty"))
+        if remote_exists():
+            self.finish_setup()
+        else:
+            self.start_login(self.finish_setup)
+
+    def finish_setup(self):
+        self.set_busy("busy_mount")
+        try:
+            install_service()
+        except subprocess.CalledProcessError as e:
+            self.busy_key = ""
+            self.refresh()
+            log = run("journalctl", "--user", "-u", SERVICE, "-n", "15",
+                      "--no-pager").stdout
+            return self.error(t("err_mount_title"), f"{e.stderr}\n{log}")
+        self.busy_key = ""
+        self.update_places(add_places, reopen=str(MOUNT_DIR))
+        self.act_autostart.setChecked(True)   # tray icon at every login
+        self.refresh()
+        self.check_login()
+
+    def on_restart_mount(self):
+        self.set_busy("busy_restart")
+        result = systemctl("restart", SERVICE)
+        self.busy_key = ""
+        self.refresh()
+        if result.returncode != 0:
+            self.notify(t("notif_restart_failed"), warning=True)
+        else:
+            self.check_login()
+
+    # ------------------------------------------------------------- sign in
+    def start_login(self, then):
+        self.after_login = then
+        self.output = ""
+        self.cancelled = False
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self.read_output)
+        self.proc.finished.connect(self.login_finished)
+        self.proc.start(shutil.which("rclone"), ["authorize", "onedrive"])
+        self.busy_key = "busy_browser"
+        self.refresh()
+        if not self.isVisible():
+            self.notify(t("notif_browser"))
+
+    def read_output(self):
+        self.output += bytes(self.proc.readAllStandardOutput()).decode(errors="replace")
+
+    def on_cancel(self):
+        if self.proc:
+            self.cancelled = True
+            self.proc.kill()
+
+    def login_finished(self, code, _status):
+        proc, self.proc = self.proc, None
+        proc.deleteLater()
+        self.busy_key = ""
+        if self.cancelled:
+            self.resume_service()
+            return self.refresh()
+        try:
+            if code != 0:
+                raise RuntimeError(self.output.strip()[-800:] or t("err_rclone_stopped"))
+            token = parse_token(self.output)
+            drive_id, drive_type = fetch_drive(token["access_token"])
+            write_remote(token, drive_id, drive_type)
+        except Exception as e:
+            self.resume_service()
+            self.refresh()
+            return self.error(t("err_login_title"), str(e))
+        self.alert = ""
+        then, self.after_login = self.after_login, None
+        then()
+        if not self.isVisible():
+            self.notify(t("notif_signed_in"))
+
+    def resume_service(self):
+        if SERVICE_PATH.exists():
+            systemctl("start", SERVICE)
+
+    def on_relogin(self):
+        systemctl("stop", SERVICE)   # prevents rclone writing the config at the same time
+
+        def done():
+            self.resume_service()
+            self.refresh()
+            self.check_login()
+
+        self.start_login(done)
+
+    # ------------------------------------------------------- sign-in check
+    def check_login(self):
+        if self.proc or missing_deps() or not remote_exists():
+            return
+        p = QProcess(self)
+        p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        p.finished.connect(lambda code, _s: self.login_checked(p, code))
+        p.start(shutil.which("rclone"), ["about", f"{REMOTE}:", "--json",
+                                         "--contimeout", "15s", "--timeout", "30s"])
+
+    def login_checked(self, p: QProcess, code: int):
+        out = bytes(p.readAll()).decode(errors="replace")
+        p.deleteLater()
+        if code == 0:
+            self.alert = ""
+            try:
+                info = json.loads(out[out.index("{"):])
+                self.storage = (human(info["used"]), human(info["total"]))
+            except (ValueError, KeyError):
+                self.storage = None
+        elif any(e in out.lower() for e in AUTH_ERRORS):
+            self.alert = "login"
+        else:
+            self.alert = "offline"
+        self.refresh()
+
+    # --------------------------------------------------------------- other
+    def update_places(self, change, reopen: str | None = None):
+        restart = False
+        if dolphin_running():
+            answer = QMessageBox.question(self, t("dolphin_title"), t("dolphin_text"))
+            restart = answer == QMessageBox.StandardButton.Yes
+            if restart:
+                run("pkill", "-x", "dolphin")
+                for _ in range(50):
+                    if not dolphin_running():
+                        break
+                    time.sleep(0.1)
+        try:
+            change()
+        except Exception as e:
+            self.error(t("err_places_title"), str(e))
+        if restart:
+            args = ["dolphin"] + ([reopen] if reopen else [])
+            subprocess.Popen(args, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def on_disconnect(self):
+        box = QMessageBox(self)
+        box.setWindowTitle(t("disc_title"))
+        box.setText(t("disc_text"))
+        box.setInformativeText(t("disc_info"))
+        keep = box.addButton(t("disconnect"), QMessageBox.ButtonRole.AcceptRole)
+        full = box.addButton(t("disc_full"), QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(t("cancel"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        choice = box.clickedButton()
+        if choice not in (keep, full):
+            return
+        self.set_busy("busy_disconnect")
+        remove_service()
+        self.busy_key = ""
+        self.update_places(remove_places)
+        self.act_autostart.setChecked(False)
+        if choice is full:
+            run("rclone", "config", "delete", REMOTE)
+        self.storage = None
+        self.alert = ""
+        self.refresh()
+
+    def quit_app(self):
+        self.quitting = True
+        if self.proc:
+            self.on_cancel()
+            self.proc.waitForFinished(2000)
+        self.tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        # Closing the window = hiding it; the app keeps running in the tray.
+        if not self.quitting and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            if not self.hint_shown:
+                self.notify(t("notif_tray_hint"))
+                self.hint_shown = True
+            return
+        super().closeEvent(event)
+        self.quit_app()
+
+
+def cleanup():
+    """Remove everything the app created outside rclone.conf."""
+    remove_service()
+    remove_places()
+    set_autostart(False)
+    for old in LEGACY_IDS:
+        (AUTOSTART.parent / f"{old}.desktop").unlink(missing_ok=True)
+    print(t("cleanup_done", remote=REMOTE))
+
+
+def main():
+    if "--cleanup" in sys.argv:
+        return cleanup()
+    tray_mode = "--tray" in sys.argv
+    signal.signal(signal.SIGINT, signal.SIG_DFL)   # Ctrl+C stops the app in a terminal
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setDesktopFileName(APP_ID)
+    app.setQuitOnLastWindowClosed(False)
+
+    # Only one instance: a second start shows the existing window.
+    sock = QLocalSocket()
+    sock.connectToServer(SOCKET_NAME)
+    if sock.waitForConnected(300):
+        if not tray_mode:
+            sock.write(b"show")
+            sock.flush()
+            sock.waitForBytesWritten(300)
+        sock.disconnectFromServer()
+        return
+    QLocalServer.removeServer(SOCKET_NAME)
+    server = QLocalServer()
+    server.listen(SOCKET_NAME)
+
+    migrate_legacy_autostart()   # from earlier app names
+
+    win = Window()
+
+    def on_connection():
+        conn = server.nextPendingConnection()
+        conn.readyRead.connect(
+            lambda: win.show_window() if bytes(conn.readAll()).startswith(b"show") else None)
+        conn.disconnected.connect(conn.deleteLater)
+
+    server.newConnection.connect(on_connection)
+
+    if not tray_mode:
+        win.show_window()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
